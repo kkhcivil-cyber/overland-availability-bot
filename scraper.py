@@ -7,12 +7,10 @@ from datetime import datetime, date
 import requests
 from bs4 import BeautifulSoup
 
-# The Overland Track availability page
+# Overland Track availability page
 URL = "https://azapps.customlinc.com.au/tasparksoverland/BookingCat/Availability/?Category=OVERLAND"
 
-# Date window you care about:
-#   - START_DATE is "today" (the day the script runs)
-#   - END_DATE is fixed: 31 May 2026
+# Date window end
 END_DATE = date(2026, 5, 31)
 
 # File used to remember the last availability list
@@ -21,63 +19,63 @@ STATE_FILE = Path("state.json")
 
 def get_start_date() -> date:
     """
-    Return today's date. This will be 'today' in the GitHub server's timezone.
-    Good enough for our purpose.
+    Start date is 'today' on the GitHub runner.
     """
     return date.today()
 
 
 def parse_availability(lines):
     """
-    Parse lines of text from the page into a list of
-    (date, status, spots) tuples.
+    Parse lines of text into a list of (date, status, spots) tuples.
 
-    Example pattern on the page:
-      Saturday 6 Dec 2025 025
-      Available
-      1 Available
-
-      Monday 8 Dec 2025 025
-      Fully Booked
+    We treat each "date line" as the start of a block, up to the next date line.
     """
+
     date_pattern = re.compile(
         r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
         r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})"
     )
 
+    # Collect indices of all lines that look like dates
+    date_indices = []
+    for i, line in enumerate(lines):
+        if date_pattern.search(line):
+            date_indices.append(i)
+
     results = []
 
-    for i, line in enumerate(lines):
-        m = date_pattern.search(line)
+    for idx, start_idx in enumerate(date_indices):
+        # End of this block is the next date line, or the end of the list
+        end_idx = date_indices[idx + 1] if idx + 1 < len(date_indices) else len(lines)
+        block = lines[start_idx:end_idx]
+
+        # First line of block is the date line
+        m = date_pattern.search(block[0])
         if not m:
             continue
 
-        weekday, day, mon_abbr, year = m.groups()
+        _, day, mon_abbr, year = m.groups()
         date_str = f"{day} {mon_abbr} {year}"
+
         try:
             dt = datetime.strptime(date_str, "%d %b %Y").date()
         except ValueError:
-            # If parsing fails for some reason, skip this line
             continue
 
         status = None
         spots = None
 
-        # Look ahead a few lines for status and number of spots
-        for j in range(1, 5):
-            if i + j >= len(lines):
-                break
-            t = lines[i + j]
+        # Look through this block only for status and spots
+        for line in block[1:]:
+            if "Fully Booked" in line:
+                status = "Fully Booked"
+            elif "Available" in line and status is None:
+                # Status is "Available" only if not already Fully Booked
+                status = "Available"
 
-            if status is None:
-                if "Fully Booked" in t:
-                    status = "Fully Booked"
-                elif "Available" in t:
-                    # This may be "Available" or "1 Available"
-                    status = t
-
-            if "Available" in t:
-                m2 = re.search(r"(\d+)", t)
+            # Look for "X Available"
+            if "Available" in line:
+                m2 = re.search(r"(\d+)\s+Available", line)
                 if m2:
                     spots = int(m2.group(1))
 
@@ -88,11 +86,11 @@ def parse_availability(lines):
 
 def load_previous_state():
     """
-    Load the last known availability from state.json.
+    Load last known availability from state.json.
 
     Returns:
-      - None if this is the first run / file missing / unreadable
-      - a list of {"date": "YYYY-MM-DD", "spots": int} otherwise
+      - None if first run / file missing
+      - list of {"date": "YYYY-MM-DD", "spots": int} otherwise
     """
     if not STATE_FILE.exists():
         return None
@@ -102,14 +100,12 @@ def load_previous_state():
             data = json.load(f)
         return data.get("availabilities", [])
     except Exception:
-        # If anything goes wrong, treat as no previous state
         return None
 
 
 def save_state(avail_list):
     """
-    Save the current availability list to state.json.
-    avail_list is a list of {"date": "YYYY-MM-DD", "spots": int}
+    Save current availability list to state.json.
     """
     data = {"availabilities": avail_list}
     with STATE_FILE.open("w", encoding="utf-8") as f:
@@ -118,13 +114,12 @@ def save_state(avail_list):
 
 def send_telegram_message(text: str):
     """
-    Send a raw text message to Telegram using the bot.
+    Send a text message via Telegram bot.
     """
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
     resp = requests.post(url, data={"chat_id": chat_id, "text": text})
     resp.raise_for_status()
     print("Telegram notification sent.")
@@ -133,7 +128,6 @@ def send_telegram_message(text: str):
 def send_availability_list_message(start_date: date, interesting):
     """
     Send a message listing all currently available dates.
-    'interesting' is a list of (dt, status, spots).
     """
     lines = [
         "📋 Overland Track availability",
@@ -146,7 +140,7 @@ def send_availability_list_message(start_date: date, interesting):
         if spots is not None:
             lines.append(f"- {date_str}: {spots} spots ({status})")
         else:
-            lines.append(f"- {date_str}: {status}")
+            lines.append(f"- {date_str}: {status or 'Unknown status'}")
 
     text = "\n".join(lines)
     send_telegram_message(text)
@@ -154,8 +148,7 @@ def send_availability_list_message(start_date: date, interesting):
 
 def send_no_availability_message(start_date: date):
     """
-    Send a message saying there is no availability in the window
-    (used when previously there WAS availability).
+    Send a message saying there is currently no availability.
     """
     text = (
         "⚠️ Overland Track availability changed.\n"
@@ -182,10 +175,10 @@ def check_overland():
     soup = BeautifulSoup(resp.text, "html.parser")
     text = soup.get_text(separator="\n")
 
-    # Turn into clean, non-empty lines
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     all_days = parse_availability(lines)
+    print(f"Found {len(all_days)} date entries on the page.")
 
     # Filter by date range and availability
     interesting = []
@@ -193,11 +186,13 @@ def check_overland():
         if not (start_date <= dt <= END_DATE):
             continue
 
-        # We treat any date with spots > 0 as available
-        if spots is not None and spots > 0:
+        # Treat as available if status contains "Available" and spots > 0 (if known)
+        if status and "Available" in status and (spots is None or spots > 0):
             interesting.append((dt, status, spots))
 
-    # Build a simplified representation of the current availability
+    print(f"Found {len(interesting)} available dates in the desired window.")
+
+    # Build simplified state representation
     current_state = [
         {"date": dt.isoformat(), "spots": spots}
         for dt, status, spots in sorted(interesting, key=lambda x: x[0])
@@ -205,13 +200,11 @@ def check_overland():
 
     previous_state = load_previous_state()
 
-    # FIRST RUN: no previous state
+    # FIRST RUN
     if previous_state is None:
         print("No previous state found (first run).")
-        # Save state
         save_state(current_state)
 
-        # Only send a message if there is something available
         if interesting:
             print("Initial availability found; sending full list.")
             send_availability_list_message(start_date, interesting)
@@ -219,22 +212,18 @@ def check_overland():
             print("Initial run: no availability; no notification sent.")
         return
 
-    # SUBSEQUENT RUNS: compare current vs previous
+    # SUBSEQUENT RUNS
     if current_state == previous_state:
         print("Availability unchanged; no notification sent.")
         return
 
-    # At this point, the availability list HAS changed
     print("Availability has changed since last run.")
 
     if interesting:
-        # There is at least one available date now
         send_availability_list_message(start_date, interesting)
     else:
-        # Previously there was availability, now there is none
         send_no_availability_message(start_date)
 
-    # After successfully sending the message, update state.json
     save_state(current_state)
 
 
