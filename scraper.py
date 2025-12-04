@@ -7,10 +7,11 @@ from datetime import datetime, date
 import requests
 from bs4 import BeautifulSoup
 
-# Overland Track availability page
-URL = "https://azapps.customlinc.com.au/tasparksoverland/BookingCat/Availability/?Category=OVERLAND"
+# Base URLs
+BASE_URL = "https://azapps.customlinc.com.au/tasparksoverland/BookingCat/Availability/"
+CATEGORY_URL = BASE_URL + "?Category=OVERLAND"
 
-# Date window end
+# We care about dates from "today" up to this fixed end date
 END_DATE = date(2026, 5, 31)
 
 # File used to remember the last availability list
@@ -24,33 +25,35 @@ def get_start_date() -> date:
     return date.today()
 
 
-def parse_availability(lines):
+# Pattern for lines like "Saturday 6 Dec 2025"
+DATE_PATTERN = re.compile(
+    r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
+    r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})"
+)
+
+
+def parse_availability_from_html(html_text):
     """
-    Parse lines of text into a list of (date, status, spots) tuples.
-
-    We treat each "date line" as the start of a block, up to the next date line.
+    Parse a single HTML page into a list of (date, status, spots) tuples.
+    We treat each "date line" as the start of a block until the next date line.
     """
-
-    date_pattern = re.compile(
-        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+"
-        r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})"
-    )
-
-    # Collect indices of all lines that look like dates
-    date_indices = []
-    for i, line in enumerate(lines):
-        if date_pattern.search(line):
-            date_indices.append(i)
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = soup.get_text(separator="\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     results = []
 
+    # Find all lines that look like dates
+    date_indices = []
+    for i, line in enumerate(lines):
+        if DATE_PATTERN.search(line):
+            date_indices.append(i)
+
     for idx, start_idx in enumerate(date_indices):
-        # End of this block is the next date line, or the end of the list
         end_idx = date_indices[idx + 1] if idx + 1 < len(date_indices) else len(lines)
         block = lines[start_idx:end_idx]
 
-        # First line of block is the date line
-        m = date_pattern.search(block[0])
+        m = DATE_PATTERN.search(block[0])
         if not m:
             continue
 
@@ -65,15 +68,14 @@ def parse_availability(lines):
         status = None
         spots = None
 
-        # Look through this block only for status and spots
+        # Look for status and "X Available" inside this block
         for line in block[1:]:
             if "Fully Booked" in line:
                 status = "Fully Booked"
             elif "Available" in line and status is None:
-                # Status is "Available" only if not already Fully Booked
+                # If not already set to "Fully Booked", mark as "Available"
                 status = "Available"
 
-            # Look for "X Available"
             if "Available" in line:
                 m2 = re.search(r"(\d+)\s+Available", line)
                 if m2:
@@ -84,10 +86,89 @@ def parse_availability(lines):
     return results
 
 
+def fetch_all_days():
+    """
+    Simulate:
+      1) Opening the Overland availability page
+      2) Clicking "Next days" repeatedly (via ?changeDate&localtime=...)
+    Collect all unique dates that appear until we reach/past END_DATE
+    or run out of new dates.
+    """
+    session = requests.Session()
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; OverlandChecker/1.0; "
+            "+https://github.com/yourname/overland-availability-bot)"
+        )
+    }
+
+    all_by_date = {}
+
+    # 1) Initial page with ?Category=OVERLAND
+    resp = session.get(CATEGORY_URL, headers=headers, timeout=30)
+    resp.raise_for_status()
+    page_results = parse_availability_from_html(resp.text)
+    print(f"Initial page has {len(page_results)} date rows.")
+
+    for dt, status, spots in page_results:
+        all_by_date[dt] = (status, spots)
+
+    max_date_seen = max(all_by_date.keys()) if all_by_date else None
+
+    # 2) Page forward repeatedly using changeDate
+    for page_num in range(1, 80):  # safety limit on number of pages
+        # Format similar to what the browser sends: "YYYY-MM-DD, HH:MM:SS:000"
+        localtime_str = datetime.utcnow().strftime("%Y-%m-%d, %H:%M:%S:000")
+        params = {"changeDate": "", "localtime": localtime_str}
+
+        resp = session.get(BASE_URL, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+
+        page_results = parse_availability_from_html(resp.text)
+        print(f"Page {page_num + 1} has {len(page_results)} date rows.")
+
+        if not page_results:
+            print("No dates on this page; stopping pagination.")
+            break
+
+        new_dates = False
+        for dt, status, spots in page_results:
+            if dt not in all_by_date:
+                new_dates = True
+            all_by_date[dt] = (status, spots)
+
+        current_max = max(all_by_date.keys())
+        print(f"Current max date seen: {current_max}")
+
+        # Stop if we've reached or passed END_DATE
+        if current_max >= END_DATE:
+            print("Reached or passed END_DATE; stopping pagination.")
+            break
+
+        # Stop if the max date hasn't moved forward (protect against loops)
+        if max_date_seen is not None and current_max <= max_date_seen:
+            print("No progress in max date; stopping pagination.")
+            break
+
+        max_date_seen = current_max
+
+        # Stop if this page didn't add any new dates
+        if not new_dates:
+            print("No new dates found on this page; stopping pagination.")
+            break
+
+    # Turn dict back into a sorted list of tuples
+    all_days = [(dt, status, spots) for dt, (status, spots) in all_by_date.items()]
+    all_days.sort(key=lambda x: x[0])
+
+    print(f"Total unique dates collected: {len(all_days)}")
+    return all_days
+
+
 def load_previous_state():
     """
     Load last known availability from state.json.
-
     Returns:
       - None if first run / file missing
       - list of {"date": "YYYY-MM-DD", "spots": int} otherwise
@@ -162,37 +243,23 @@ def check_overland():
     start_date = get_start_date()
     print(f"Checking availability between {start_date} and {END_DATE}...")
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; OverlandChecker/1.0; "
-            "+https://github.com/yourname/overland-availability-bot)"
-        )
-    }
+    # Fetch ALL dates by simulating "Next days" clicks
+    all_days = fetch_all_days()
+    print(f"Total dates retrieved from site: {len(all_days)}")
 
-    resp = requests.get(URL, headers=headers, timeout=30)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text(separator="\n")
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    all_days = parse_availability(lines)
-    print(f"Found {len(all_days)} date entries on the page.")
-
-    # Filter by date range and availability
+    # Filter down to our window and "available" status
     interesting = []
     for dt, status, spots in all_days:
         if not (start_date <= dt <= END_DATE):
             continue
 
-        # Treat as available if status contains "Available" and spots > 0 (if known)
+        # Treat as available if it says Available and spots >= 1 (or unknown)
         if status and "Available" in status and (spots is None or spots > 0):
             interesting.append((dt, status, spots))
 
-    print(f"Found {len(interesting)} available dates in the desired window.")
+    print(f"Found {len(interesting)} available dates in desired window.")
 
-    # Build simplified state representation
+    # Build simple state representation (date + spots)
     current_state = [
         {"date": dt.isoformat(), "spots": spots}
         for dt, status, spots in sorted(interesting, key=lambda x: x[0])
